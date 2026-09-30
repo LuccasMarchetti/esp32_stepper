@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS 
+        "Cli.cpp"
+    INCLUDE_DIRS 
+        "include"
+    REQUIRES 
+        console
+        stepper
+)

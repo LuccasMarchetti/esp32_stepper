@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS 
+        "Q3hb220m.cpp"
+    INCLUDE_DIRS 
+        "include"
+    REQUIRES 
+        rmt
+        pcnt
+        nvs
+        driver
+        esp_timer
+        esp_system
+)

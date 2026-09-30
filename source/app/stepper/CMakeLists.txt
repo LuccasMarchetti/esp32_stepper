@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS 
+        "StepperTask.cpp"
+    INCLUDE_DIRS 
+        "include"
+    REQUIRES 
+        q3hb220m
+        freertos
+)
