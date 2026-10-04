@@ -1,9 +1,18 @@
-#include "Cli.hpp"
-#include "Q3hb220m.hpp"
-#include "esp_log.h"
 #include "argtable3/argtable3.h"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <cctype>
+#include <string>
+#include "linenoise/linenoise.h"
+
+#include "soc/soc_caps.h"
+#include "esp_console.h"
+#include "esp_log.h"
+
+#include "Q3hb220m.hpp"
+#include "StepperTask.hpp"
+#include "Cli.hpp"
 
 static const char* TAG = "CLI";
 static StepperTask* s_stepper_ref = nullptr;
@@ -18,17 +27,37 @@ static struct {
 static struct {
     struct arg_dbl *angle;
     struct arg_end *end;
-} angle_args;
+} move_angle_args;
 
 static struct {
-    struct arg_int *ticks;
+    struct arg_dbl *angle;
     struct arg_end *end;
-} speed_ticks_args;
+} goto_angle_args;
 
 static struct {
-    struct arg_int *steps;
+    struct arg_dbl *rev_s;
     struct arg_end *end;
-} steps_args;
+} start_speed_args;
+
+static struct {
+    struct arg_dbl *rev_s;
+    struct arg_end *end;
+} speed_args;
+
+static struct {
+    struct arg_dbl *rev_s2;
+    struct arg_end *end;
+} accel_args;
+
+static struct {
+    struct arg_str *input;
+    struct arg_end *end;
+} sk1_steps_args;
+
+static struct {
+    struct arg_str *input;
+    struct arg_end *end;
+} sk2_steps_args;
 
 static struct {
     struct arg_str *group;
@@ -56,15 +85,23 @@ bool Cli::init(StepperTask& stepper_task) {
     repl_config.prompt = "\033[0mesp32> ";
     repl_config.max_cmdline_length = 256;
 
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+    esp_console_dev_usb_serial_jtag_config_t usb_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    if (esp_console_new_repl_usb_serial_jtag(&usb_config, &repl_config, &repl_) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize ESP Console REPL in USB mode.");
+        return false;
+    }
+#else
     esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     uart_config.baud_rate = 115200;
 
     if (esp_console_new_repl_uart(&uart_config, &repl_config, &repl_) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize ESP Console REPL.");
+        ESP_LOGE(TAG, "Failed to initialize ESP Console REPL in UART mode.");
         return false;
     }
+#endif
 
-    esp_console_register_help_command();
+    ESP_ERROR_CHECK(esp_console_register_help_command());
     register_stepper_commands();
 
     is_initialized_ = true;
@@ -73,6 +110,7 @@ bool Cli::init(StepperTask& stepper_task) {
 
 bool Cli::start() {
     if (!is_initialized_ || !repl_) return false;
+    linenoiseSetDumbMode(0);
     return (esp_console_start_repl(repl_) == ESP_OK);
 }
 
@@ -85,18 +123,6 @@ void Cli::register_stepper_commands() {
         .func = [](int argc, char** argv) -> int {
             if (!s_stepper_ref) return 1;
 
-            uint32_t current_ticks = s_stepper_ref->get_speed_ticks();
-            uint32_t res_hz = s_stepper_ref->get_rmt_resolution_hz(); 
-            float half_period_us = (static_cast<float>(current_ticks) * 1'000'000.0f) / static_cast<float>(res_hz);
-            float pulse_freq_hz = static_cast<float>(res_hz) / (2.0f * static_cast<float>(current_ticks));
-
-            char freq_str[32];
-            if (pulse_freq_hz >= 1000.0f) {
-                snprintf(freq_str, sizeof(freq_str), "%.2f kHz", pulse_freq_hz / 1000.0f);
-            } else {
-                snprintf(freq_str, sizeof(freq_str), "%.2f Hz", pulse_freq_hz);
-            }
-
             auto active_group = s_stepper_ref->get_subdivision_group();
             bool is_sk1 = (active_group == Q3hb220m::SubdivisionGroup::SK1);
             uint32_t sk1_val = s_stepper_ref->get_sk1_steps();
@@ -106,11 +132,10 @@ void Cli::register_stepper_commands() {
             const char* dir_str = (dir == Q3hb220m::Direction::CW) ? "CW (Clockwise)" : "CCW (Counter-Clockwise)";
 
             bool is_busy = s_stepper_ref->is_busy();
-            bool is_continuous = s_stepper_ref->is_continuous();
             
             const char* motion_mode = "IDLE (Stopped)";
             if (is_busy) {
-                motion_mode = is_continuous ? "RUNNING (Continuous Mode)" : "MOVING (Positional Target)";
+                motion_mode = "MOVING (Positional Target)";
             }
 
             bool driver_ok = s_stepper_ref->is_driver_ready();
@@ -119,9 +144,12 @@ void Cli::register_stepper_commands() {
             printf("\n--- STEPPER MOTOR TELEMETRY ---\n");
             printf("Current Position: %.3f deg\n", s_stepper_ref->get_current_angle_degrees());
             printf("Direction:        %s\n", dir_str);
-            printf("Pulse Timing:     %" PRIu32 " ticks (%.2f us half-period | %s)\n", 
-       current_ticks, half_period_us, freq_str);
-            printf("Angular Speed:    %.2f deg/s\n", s_stepper_ref->get_speed_deg_per_sec());
+            printf("Motion params:\n");
+            printf("\tStart Speed: %.2f rev/s (%.2f deg/s)\n", s_stepper_ref->get_start_speed_rev_s(), s_stepper_ref->get_start_speed_deg_per_sec());
+            printf("\tSpeed: %.2f rev/s (%.2f deg/s)\n", s_stepper_ref->get_speed_rev_s(), s_stepper_ref->get_speed_deg_per_sec());
+            printf("\tAccel: %.2f rev/s² (%.2f deg/s²)\n",
+                s_stepper_ref->get_acceleration_rev_s2(),
+                s_stepper_ref->get_acceleration_deg_per_sec2());
             printf("Subdivision:      %s [Active: %" PRIu32 " s/r] (SK1: %" PRIu32 " s/r | SK2: %" PRIu32 " s/r)\n",
                 is_sk1 ? "SK1" : "SK2",
                 is_sk1 ? sk1_val : sk2_val,
@@ -139,44 +167,46 @@ void Cli::register_stepper_commands() {
     esp_console_cmd_register(&status_cmd);
 
     // Command: stepper_move <angle_deg>
-    angle_args.angle = arg_dbl1(nullptr, nullptr, "<deg>", "Relative angle displacement (+ CW, - CCW)");
-    angle_args.end = arg_end(1);
+    move_angle_args.angle = arg_dbl1(nullptr, nullptr, "<deg>", "Relative angle displacement (+ CW, - CCW)");
+    move_angle_args.end = arg_end(1);
     const esp_console_cmd_t move_cmd = {
         .command = "stepper_move",
         .help = "Executes relative angle movement",
         .hint = nullptr,
         .func = [](int argc, char** argv) -> int {
-            int nerrors = arg_parse(argc, argv, (void**)&angle_args);
+            int nerrors = arg_parse(argc, argv, (void**)&move_angle_args);
             if (nerrors != 0) {
-                arg_print_errors(stderr, angle_args.end, argv[0]);
+                arg_print_errors(stderr, move_angle_args.end, argv[0]);
                 return 1;
             }
-            s_stepper_ref->move_delta_async(static_cast<float>(angle_args.angle->dval[0]));
-            printf("Command queued: Move relative %.2f deg\n", angle_args.angle->dval[0]);
+            s_stepper_ref->move_delta_async(static_cast<float>(move_angle_args.angle->dval[0]));
+            printf("Command queued: Move relative %.2f deg\n", move_angle_args.angle->dval[0]);
             return 0;
         },
-        .argtable = &angle_args,
+        .argtable = &move_angle_args,
         .func_w_context = nullptr,
         .context = nullptr
     };
     esp_console_cmd_register(&move_cmd);
 
     // Command: stepper_goto <angle_deg>
+    goto_angle_args.angle = arg_dbl1(nullptr, nullptr, "<deg>", "Absolute target angle in degrees");
+    goto_angle_args.end = arg_end(1);
     const esp_console_cmd_t goto_cmd = {
         .command = "stepper_goto",
         .help = "Moves motor to absolute target position in degrees",
         .hint = nullptr,
         .func = [](int argc, char** argv) -> int {
-            int nerrors = arg_parse(argc, argv, (void**)&angle_args);
+            int nerrors = arg_parse(argc, argv, (void**)&goto_angle_args);
             if (nerrors != 0) {
-                arg_print_errors(stderr, angle_args.end, argv[0]);
+                arg_print_errors(stderr, goto_angle_args.end, argv[0]);
                 return 1;
             }
-            s_stepper_ref->move_abs_async(static_cast<float>(angle_args.angle->dval[0]));
-            printf("Command queued: Move absolute %.2f deg\n", angle_args.angle->dval[0]);
+            s_stepper_ref->move_abs_async(static_cast<float>(goto_angle_args.angle->dval[0]));
+            printf("Command queued: Move absolute %.2f deg\n", goto_angle_args.angle->dval[0]);
             return 0;
         },
-        .argtable = &angle_args,
+        .argtable = &goto_angle_args,
         .func_w_context = nullptr,
         .context = nullptr
     };
@@ -199,31 +229,6 @@ void Cli::register_stepper_commands() {
         .context = nullptr
     };
     esp_console_cmd_register(&tare_cmd);
-    
-    // Command: stepper_run <--cw | --ccw>
-    dir_args.cw = arg_lit0(nullptr, "cw", "Clockwise direction");
-    dir_args.ccw = arg_lit0(nullptr, "ccw", "Counter-clockwise direction");
-    dir_args.end = arg_end(1);
-    const esp_console_cmd_t run_cmd = {
-        .command = "stepper_run",
-        .help = "Starts continuous motion in specified direction",
-        .hint = nullptr,
-        .func = [](int argc, char** argv) -> int {
-            int nerrors = arg_parse(argc, argv, (void**)&dir_args);
-            if (nerrors != 0 || (dir_args.cw->count == 0 && dir_args.ccw->count == 0)) {
-                printf("Error: Must specify either --cw or --ccw flag.\n");
-                return 1;
-            }
-            auto dir = (dir_args.cw->count > 0) ? Q3hb220m::Direction::CW : Q3hb220m::Direction::CCW;
-            s_stepper_ref->start_continuous_async(dir);
-            printf("Command queued: Continuous run (%s)\n", (dir == Q3hb220m::Direction::CW) ? "CW" : "CCW");
-            return 0;
-        },
-        .argtable = &dir_args,
-        .func_w_context = nullptr,
-        .context = nullptr
-    };
-    esp_console_cmd_register(&run_cmd);
 
     // Command: stepper_stop
     const esp_console_cmd_t stop_cmd = {
@@ -242,6 +247,10 @@ void Cli::register_stepper_commands() {
     esp_console_cmd_register(&stop_cmd);
 
     // Command: stepper_dir <--cw | --ccw>
+    dir_args.cw = arg_lit0(nullptr, "cw", "Set direction to Clockwise");
+    dir_args.ccw = arg_lit0(nullptr, "ccw", "Set direction to Counter-Clockwise");
+    dir_args.end = arg_end(2);
+    
     const esp_console_cmd_t dir_cmd = {
         .command = "stepper_dir",
         .help = "Changes motor direction (applies dynamically during run)",
@@ -263,29 +272,77 @@ void Cli::register_stepper_commands() {
     };
     esp_console_cmd_register(&dir_cmd);
 
-    // Command: stepper_speed <ticks>
-    speed_ticks_args.ticks = arg_int1(nullptr, nullptr, "<ticks>", "Half-period pulse duration in RMT ticks (min-32767)");
-    speed_ticks_args.end = arg_end(1);
-    const esp_console_cmd_t speed_cmd = {
-        .command = "stepper_speed",
-        .help = "Sets pulse half-period duration directly in RMT hardware ticks",
+    // Command: stepper_start_speed <revs/s>
+    start_speed_args.rev_s = arg_dbl1(nullptr, nullptr, "<revs/s>", "Stepper start speed in revolutions per second");
+    start_speed_args.end = arg_end(1);
+    const esp_console_cmd_t start_speed_cmd = {
+        .command = "stepper_start_speed",
+        .help = "Sets start speed in revolutions per second (rev/s)",
         .hint = nullptr,
         .func = [](int argc, char** argv) -> int {
-            int nerrors = arg_parse(argc, argv, (void**)&speed_ticks_args);
+            int nerrors = arg_parse(argc, argv, (void**)&start_speed_args);
             if (nerrors != 0) {
-                arg_print_errors(stderr, speed_ticks_args.end, argv[0]);
+                arg_print_errors(stderr, start_speed_args.end, argv[0]);
                 return 1;
             }
-            uint32_t ticks = static_cast<uint32_t>(speed_ticks_args.ticks->ival[0]);
-            s_stepper_ref->set_speed_async(ticks);
-            printf("Command queued: Speed set to %" PRIu32 " RMT ticks\n", ticks);
+            float rev_s = static_cast<float>(start_speed_args.rev_s->dval[0]);
+            s_stepper_ref->set_start_speed_async(rev_s);
+            printf("Command queued: Speed set to %.2f rev/s\n", rev_s);
             return 0;
         },
-        .argtable = &speed_ticks_args,
+        .argtable = &start_speed_args,
+        .func_w_context = nullptr,
+        .context = nullptr
+    };
+    esp_console_cmd_register(&start_speed_cmd);
+
+    // Command: stepper_speed <revs/s>
+    speed_args.rev_s = arg_dbl1(nullptr, nullptr, "<revs/s>", "Speed in revolutions per second");
+    speed_args.end = arg_end(1);
+    const esp_console_cmd_t speed_cmd = {
+        .command = "stepper_speed",
+        .help = "Sets target speed in revolutions per second (rev/s)",
+        .hint = nullptr,
+        .func = [](int argc, char** argv) -> int {
+            int nerrors = arg_parse(argc, argv, (void**)&speed_args);
+            if (nerrors != 0) {
+                arg_print_errors(stderr, speed_args.end, argv[0]);
+                return 1;
+            }
+            float rev_s = static_cast<float>(speed_args.rev_s->dval[0]);
+            s_stepper_ref->set_speed_async(rev_s);
+            printf("Command queued: Speed set to %.2f rev/s\n", rev_s);
+            return 0;
+        },
+        .argtable = &speed_args,
         .func_w_context = nullptr,
         .context = nullptr
     };
     esp_console_cmd_register(&speed_cmd);
+
+    // Command: stepper_accel <revs/s^2>
+    accel_args.rev_s2 = arg_dbl1(nullptr, nullptr, "<revs/s^2>", "Acceleration in revolutions per second squared");
+    accel_args.end = arg_end(1);
+    const esp_console_cmd_t accel_cmd = {
+        .command = "stepper_accel",
+        .help = "Sets acceleration in revolutions per second squared (rev/s^2)",
+        .hint = nullptr,
+        .func = [](int argc, char** argv) -> int {
+            int nerrors = arg_parse(argc, argv, (void**)&accel_args);
+            if (nerrors != 0) {
+                arg_print_errors(stderr, accel_args.end, argv[0]);
+                return 1;
+            }
+            float rev_s2 = static_cast<float>(accel_args.rev_s2->dval[0]);
+            s_stepper_ref->set_acceleration_async(rev_s2);
+            printf("Command queued: Acceleration set to %.2f rev/s^2\n", rev_s2);
+            return 0;
+        },
+        .argtable = &accel_args,
+        .func_w_context = nullptr,
+        .context = nullptr
+    };
+    esp_console_cmd_register(&accel_cmd);
 
     // Command: stepper_sub <sk1|sk2>
     group_args.group = arg_str1(nullptr, nullptr, "<sk1|sk2>", "Subdivision group");
@@ -318,45 +375,97 @@ void Cli::register_stepper_commands() {
     };
     esp_console_cmd_register(&sub_cmd);
 
-    // Command: stepper_sk1 <steps>
-    steps_args.steps = arg_int1(nullptr, nullptr, "<s/r>", "Steps per revolution value from hardware table");
-    steps_args.end = arg_end(1);
+    // Command: stepper_sk1 <steps or index>
+    sk1_steps_args.input = arg_str1(nullptr, nullptr, "<s/r or i>", "Steps per revolution value from hardware table or index 0-F");
+    sk1_steps_args.end = arg_end(1);
     const esp_console_cmd_t sk1_cmd = {
         .command = "stepper_sk1",
         .help = "Configures steps/rev for SK1",
         .hint = nullptr,
         .func = [](int argc, char** argv) -> int {
-            int nerrors = arg_parse(argc, argv, (void**)&steps_args);
+            int nerrors = arg_parse(argc, argv, (void**)&sk1_steps_args);
             if (nerrors != 0) {
-                arg_print_errors(stderr, steps_args.end, argv[0]);
+                arg_print_errors(stderr, sk1_steps_args.end, argv[0]);
                 return 1;
             }
-            s_stepper_ref->set_sk1_steps_async(static_cast<uint32_t>(steps_args.steps->ival[0]));
-            printf("Command queued: Set SK1 steps -> %d s/r\n", steps_args.steps->ival[0]);
+
+            const char* str = sk1_steps_args.input->sval[0];
+            size_t len = strlen(str);
+            uint32_t parsed_val = 0;
+
+            if (len == 1) {
+                if (std::isxdigit(static_cast<unsigned char>(str[0]))) {
+                    parsed_val = static_cast<uint32_t>(std::strtoul(str, nullptr, 16));
+                } else {
+                    printf("Error: Single-character input '%s' is not a valid hex digit (0-F).\n", str);
+                    return 1;
+                }
+            } else if (len > 1) {
+                for (size_t i = 0; i < len; ++i) {
+                    if (!std::isdigit(static_cast<unsigned char>(str[i]))) {
+                        printf("Error: Invalid input '%s'. Multi-character inputs must be decimal integers.\n", str);
+                        return 1;
+                    }
+                }
+                parsed_val = static_cast<uint32_t>(std::strtoul(str, nullptr, 10));
+            } else {
+                printf("Error: Empty input.\n");
+                return 1;
+            }
+
+            s_stepper_ref->set_sk1_steps_async(parsed_val);
+            printf("Command queued: Set SK1 value -> %lu (0x%X)\n", parsed_val, (unsigned int)parsed_val);
             return 0;
         },
-        .argtable = &steps_args,
+        .argtable = &sk1_steps_args,
         .func_w_context = nullptr,
         .context = nullptr
     };
     esp_console_cmd_register(&sk1_cmd);
 
-    // Command: stepper_sk2 <steps>
+    // Command: stepper_sk2 <steps or index>
+    sk2_steps_args.input = arg_str1(nullptr, nullptr, "<s/r or i>", "Steps per revolution value from hardware table or index 0-F");
+    sk2_steps_args.end = arg_end(1);
     const esp_console_cmd_t sk2_cmd = {
         .command = "stepper_sk2",
         .help = "Configures steps/rev for SK2",
         .hint = nullptr,
         .func = [](int argc, char** argv) -> int {
-            int nerrors = arg_parse(argc, argv, (void**)&steps_args);
+            int nerrors = arg_parse(argc, argv, (void**)&sk2_steps_args);
             if (nerrors != 0) {
-                arg_print_errors(stderr, steps_args.end, argv[0]);
+                arg_print_errors(stderr, sk2_steps_args.end, argv[0]);
                 return 1;
             }
-            s_stepper_ref->set_sk2_steps_async(static_cast<uint32_t>(steps_args.steps->ival[0]));
-            printf("Command queued: Set SK2 steps -> %d s/r\n", steps_args.steps->ival[0]);
+
+            const char* str = sk2_steps_args.input->sval[0];
+            size_t len = strlen(str);
+            uint32_t parsed_val = 0;
+
+            if (len == 1) {
+                if (std::isxdigit(static_cast<unsigned char>(str[0]))) {
+                    parsed_val = static_cast<uint32_t>(std::strtoul(str, nullptr, 16));
+                } else {
+                    printf("Error: Single-character input '%s' is not a valid hex digit (0-F).\n", str);
+                    return 1;
+                }
+            } else if (len > 1) {
+                for (size_t i = 0; i < len; ++i) {
+                    if (!std::isdigit(static_cast<unsigned char>(str[i]))) {
+                        printf("Error: Invalid input '%s'. Multi-character inputs must be decimal integers.\n", str);
+                        return 1;
+                    }
+                }
+                parsed_val = static_cast<uint32_t>(std::strtoul(str, nullptr, 10));
+            } else {
+                printf("Error: Empty input.\n");
+                return 1;
+            }
+            
+            s_stepper_ref->set_sk2_steps_async(parsed_val);
+            printf("Command queued: Set SK2 value -> %lu (0x%X)\n", parsed_val, (unsigned int)parsed_val);
             return 0;
         },
-        .argtable = &steps_args,
+        .argtable = &sk2_steps_args,
         .func_w_context = nullptr,
         .context = nullptr
     };

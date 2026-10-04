@@ -1,6 +1,5 @@
 #pragma once
 
-#include "StepperTask.hpp"
 #include "esp_console.h"
 
 /**

@@ -21,14 +21,15 @@ public:
         MOVE_DELTA_ANGLE,
         MOVE_ABS_ANGLE,
         TARE,
-        START_CONTINUOUS,
         STOP,
         SET_DIRECTION,
-        SET_SPEED_TICKS,
         SET_SUBDIVISION_GROUP,
         SET_SK1_STEPS,
         SET_SK2_STEPS,
-        SET_MOTOR_FREE
+        SET_MOTOR_FREE,
+        SET_START_SPEED,
+        SET_SPEED,
+        SET_ACCELERATION
     };
 
     /**
@@ -38,7 +39,9 @@ public:
         CommandType type;
         union {
             float angle_degrees;
-            uint32_t speed_ticks;
+            float start_speed_rev_s;
+            float speed_rev_s;
+            float acceleration_rev_s2;
             uint32_t steps_per_rev;
             Q3hb220m::Direction direction;
             Q3hb220m::SubdivisionGroup group;
@@ -89,8 +92,12 @@ public:
      */
     bool set_direction_async(Q3hb220m::Direction dir);
 
+    bool set_start_speed_async(float start_speed_rev_s);
+
     /** @brief Sets target speed as a number of RMT ticks. */
-    bool set_speed_async(uint32_t ticks);
+    bool set_speed_async(float speed_rev_s);
+
+    bool set_acceleration_async(float acceleration_rev_s2);
 
     /** @brief Switches active hardware subdivision group between SK1 and SK2. */
     bool set_subdivision_group_async(Q3hb220m::SubdivisionGroup group);
@@ -114,14 +121,26 @@ public:
     /** @brief Returns true if the RMT peripheral is actively generating pulses. */
     bool is_busy() const;
 
-    /** @brief Gets the current configured speed in ticks. */
-    uint32_t get_speed_ticks() const;
-
     /** @brief Gets the RMT resolution in Hertz. */
     uint32_t get_rmt_resolution_hz() const;
 
-    /** @brief Gets calculated angular velocity in degrees per second (°/s). */
+    /** @brief Gets start set angular velocity in degrees per second (°/s). */
+    float get_start_speed_deg_per_sec() const;
+
+    /** @brief Gets start set angular velocity in revolutions per second (rev/s). */
+    float get_start_speed_rev_s() const;
+
+    /** @brief Gets desired angular velocity in degrees per second (°/s). */
     float get_speed_deg_per_sec() const;
+
+    /** @brief Gets desired angular velocity in revolutions per second (rev/s). */
+    float get_speed_rev_s() const;
+
+    /** @brief Gets set angular acceleration in degrees per second squared (°/s²). */
+    float get_acceleration_deg_per_sec2() const;
+
+    /** @brief Gets set angular acceleration in revolutions per second squared (rev/s²). */
+    float get_acceleration_rev_s2() const;
 
     /** @brief Gets the steps-per-revolution value of the currently active group (SK1 or SK2). */
     uint32_t get_active_subdivision() const;
@@ -137,9 +156,6 @@ public:
 
     /** @brief Gets the current motion direction (CW or CCW). */
     Q3hb220m::Direction get_current_direction() const;
-
-    /** @brief Returns true if the motor is in continuous rotation mode. */
-    bool is_continuous() const;
 
     /** @brief Returns true if the Q3HB220M driver is powered and ready. */
     bool is_driver_ready() const;

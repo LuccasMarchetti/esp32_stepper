@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS 
         "RmtTx.cpp"
-        "smooth_encoder.cpp"
+        "rmt_stepper_encoder.cpp"
     INCLUDE_DIRS 
         "include"
     REQUIRES 

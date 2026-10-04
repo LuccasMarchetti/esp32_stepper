@@ -2,7 +2,7 @@
 #include "esp_log.h"
 
 static const char* TAG = "STEPPER_TASK";
-constexpr size_t QUEUE_CAPACITY = 16;
+constexpr size_t QUEUE_CAPACITY = 1;
 
 StepperTask::StepperTask() = default;
 
@@ -71,7 +71,7 @@ void StepperTask::run() {
         if (xQueueReceive(command_queue_, &cmd, portMAX_DELAY) == pdTRUE) {
             // RULE 1: If an angle-positioning move is active, wait until the goal is achieved
             // to avoid missing pulses or corrupting step count tracking.
-            if (driver_.is_busy() && !driver_.is_continuous()) {
+            if (driver_.is_busy()) {
                 while (driver_.is_busy()) {
                     vTaskDelay(pdMS_TO_TICKS(10));
                 }
@@ -81,67 +81,39 @@ void StepperTask::run() {
             switch (cmd.type) {
                 case CommandType::SET_DIRECTION: {
                     Q3hb220m::Direction new_dir = cmd.payload.direction;
-                    
-                    // RULE 2: If in continuous mode, stop RMT first, update direction, and restart
-                    if (driver_.is_continuous()) {
-                        if (driver_.get_current_direction() != new_dir) {
-                            driver_.stop();
-                            vTaskDelay(pdMS_TO_TICKS(10)); // Allow electrical/mechanical settling
-                            driver_.set_direction(new_dir);
-                            driver_.start_continuous(new_dir);
-                        }
-                    } else {
-                        driver_.set_direction(new_dir);
-                    }
+                    driver_.set_direction(new_dir);
                     break;
                 }
 
-                case CommandType::SET_SPEED_TICKS: {
-                    uint32_t new_speed = cmd.payload.speed_ticks;
-                    if (driver_.is_continuous()) {
-                        driver_.stop();
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                        driver_.set_speed_ticks(new_speed);
-                        driver_.start_continuous(driver_.get_current_direction());
-                    } else {
-                        driver_.set_speed_ticks(new_speed);
-                    }
+                case CommandType::SET_START_SPEED: {
+                    float new_start_speed = cmd.payload.start_speed_rev_s;
+                    driver_.set_start_speed_rev_s(new_start_speed);
                     break;
                 }
 
-                case CommandType::START_CONTINUOUS: {
-                    Q3hb220m::Direction target_dir = cmd.payload.direction;
-                    if (driver_.is_busy()) {
-                        driver_.stop();
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                    }
-                    driver_.start_continuous(target_dir);
+                case CommandType::SET_SPEED: {
+                    uint32_t new_speed = cmd.payload.speed_rev_s;
+                    driver_.set_speed_rev_s(new_speed);
+                    break;
+                }
+
+                case CommandType::SET_ACCELERATION: {
+                    float new_acceleration = cmd.payload.acceleration_rev_s2;
+                    driver_.set_acceleration_rev_s2(new_acceleration);
                     break;
                 }
 
                 case CommandType::MOVE_DELTA_ANGLE: {
-                    if (driver_.is_continuous()) {
-                        driver_.stop();
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                    }
                     driver_.move_delta_angle(cmd.payload.angle_degrees);
                     break;
                 }
 
                 case CommandType::MOVE_ABS_ANGLE: {
-                    if (driver_.is_continuous()) {
-                        driver_.stop();
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                    }
                     driver_.move_absolute_angle(cmd.payload.angle_degrees);
                     break;
                 }
 
                 case CommandType::TARE: {
-                    if (driver_.is_continuous()) {
-                        driver_.stop();
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                    }
                     driver_.tare();
                     break;
                 }
@@ -152,24 +124,25 @@ void StepperTask::run() {
                 }
 
                 case CommandType::SET_SUBDIVISION_GROUP: {
-                    if (driver_.is_continuous()) {
-                        driver_.stop();
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                        driver_.set_subdivision_group(cmd.payload.group);
-                        driver_.start_continuous(driver_.get_current_direction());
-                    } else {
-                        driver_.set_subdivision_group(cmd.payload.group);
-                    }
+                    driver_.set_subdivision_group(cmd.payload.group);
                     break;
                 }
 
                 case CommandType::SET_SK1_STEPS: {
-                    driver_.set_sk1_steps_per_rev(cmd.payload.steps_per_rev);
+                    if (cmd.payload.steps_per_rev < Q3hb220m::VALID_SUBDIVISIONS.size()) {
+                        driver_.set_sk1_index(static_cast<uint8_t>(cmd.payload.steps_per_rev));
+                    } else {
+                        driver_.set_sk1_steps_per_rev(cmd.payload.steps_per_rev);
+                    }
                     break;
                 }
 
                 case CommandType::SET_SK2_STEPS: {
-                    driver_.set_sk2_steps_per_rev(cmd.payload.steps_per_rev);
+                    if (cmd.payload.steps_per_rev < Q3hb220m::VALID_SUBDIVISIONS.size()) {
+                        driver_.set_sk2_index(static_cast<uint8_t>(cmd.payload.steps_per_rev));
+                    } else {
+                        driver_.set_sk2_steps_per_rev(cmd.payload.steps_per_rev);
+                    }
                     break;
                 }
 
@@ -209,13 +182,6 @@ bool StepperTask::tare_async() {
     return xQueueSend(command_queue_, &cmd, 0) == pdTRUE;
 }
 
-bool StepperTask::start_continuous_async(Q3hb220m::Direction dir) {
-    Command cmd {};
-    cmd.type = CommandType::START_CONTINUOUS;
-    cmd.payload.direction = dir;
-    return xQueueSend(command_queue_, &cmd, 0) == pdTRUE;
-}
-
 bool StepperTask::stop_async() {
     Command cmd {};
     cmd.type = CommandType::STOP;
@@ -229,10 +195,24 @@ bool StepperTask::set_direction_async(Q3hb220m::Direction dir) {
     return xQueueSend(command_queue_, &cmd, 0) == pdTRUE;
 }
 
-bool StepperTask::set_speed_async(uint32_t ticks) {
+bool StepperTask::set_start_speed_async(float start_speed_rev_s) {
     Command cmd {};
-    cmd.type = CommandType::SET_SPEED_TICKS;
-    cmd.payload.speed_ticks = ticks;
+    cmd.type = CommandType::SET_START_SPEED;
+    cmd.payload.start_speed_rev_s = start_speed_rev_s;
+    return xQueueSend(command_queue_, &cmd, 0) == pdTRUE;
+}
+
+bool StepperTask::set_speed_async(float speed_rev_s) {
+    Command cmd {};
+    cmd.type = CommandType::SET_SPEED;
+    cmd.payload.speed_rev_s = speed_rev_s;
+    return xQueueSend(command_queue_, &cmd, 0) == pdTRUE;
+}
+
+bool StepperTask::set_acceleration_async(float acceleration_rev_s2) {
+    Command cmd {};
+    cmd.type = CommandType::SET_ACCELERATION;
+    cmd.payload.acceleration_rev_s2 = acceleration_rev_s2;
     return xQueueSend(command_queue_, &cmd, 0) == pdTRUE;
 }
 
@@ -276,12 +256,27 @@ bool StepperTask::is_busy() const {
     return driver_.is_busy();
 }
 
-uint32_t StepperTask::get_speed_ticks() const {
-    return driver_.get_speed_ticks();
+float StepperTask::get_start_speed_deg_per_sec() const {
+    return driver_.get_start_speed_rev_s() * 360.0f; // Convert rev/s to deg/s
 }
 
+float StepperTask::get_start_speed_rev_s() const {
+    return driver_.get_start_speed_rev_s();
+}
 float StepperTask::get_speed_deg_per_sec() const {
-    return driver_.get_speed_deg_per_sec();
+    return driver_.get_speed_rev_s() * 360.0f; // Convert rev/s to deg/s
+}
+
+float StepperTask::get_speed_rev_s() const {
+    return driver_.get_speed_rev_s();
+}
+
+float StepperTask::get_acceleration_deg_per_sec2() const {
+    return driver_.get_acceleration_rev_s2() * 360.0f; // Convert rev/s² to deg/s²
+}
+
+float StepperTask::get_acceleration_rev_s2() const {
+    return driver_.get_acceleration_rev_s2();
 }
 
 uint32_t StepperTask::get_active_subdivision() const {
@@ -302,10 +297,6 @@ uint32_t StepperTask::get_sk2_steps() const {
 
 Q3hb220m::Direction StepperTask::get_current_direction() const {
     return driver_.get_current_direction();
-}
-
-bool StepperTask::is_continuous() const {
-    return driver_.is_continuous();
 }
 
 bool StepperTask::is_driver_ready() const { 

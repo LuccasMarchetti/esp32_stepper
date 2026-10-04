@@ -1,59 +1,15 @@
-#include "Q3hb220m.hpp"
-#include "smooth_encoder.hpp"
-#include "esp_log.h"
-#include "esp_system.h"
-#include "esp_rom_sys.h"
-#include <cmath>
-
+#include <stdint.h>
 #include <cmath>
 #include <algorithm>
 
-smooth_motion_config_t plan_motion(
-    uint32_t total_steps,         // Total de passos do movimento
-    uint32_t target_rpm,          // RPM desejado
-    uint32_t steps_per_rev,       // Resolução atual (400 a 60000)
-    uint32_t start_freq_hz,       // Frequência de arranque (ex: 50 a 200 Hz)
-    float accel_rev_per_sec2      // Aceleração em voltas/s² (ex: 5.0f para 5 voltas/s²)
-) {
-    smooth_motion_config_t motion = {};
-    if (total_steps == 0) return motion;
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_rom_sys.h"
+#include "esp_attr.h"
 
-    // 1. Calcula a frequência de cruzeiro (Hz) direta
-    uint32_t f_max = (target_rpm * steps_per_rev) / 60;
-    if (f_max <= start_freq_hz) {
-        f_max = start_freq_hz + 1;
-    }
-
-    // 2. Converte aceleração em passos/s² para a resolução corrente
-    float accel_steps_per_sec2 = accel_rev_per_sec2 * steps_per_rev;
-
-    // 3. Passos teóricos de aceleração
-    float delta_f2 = (float)(f_max * f_max) - (float)(start_freq_hz * start_freq_hz);
-    uint32_t n_accel_calc = (uint32_t)(delta_f2 / (2.0f * accel_steps_per_sec2));
-
-    // Trava no limite máximo do buffer do RMT
-    uint32_t n_accel_allowed = std::min(n_accel_calc, (uint32_t)SMOOTH_ENCODER_MAX_RAMP_STEPS);
-
-    // 4. Perfil Triangular vs Trapezoidal
-    if (2 * n_accel_allowed > total_steps) {
-        motion.n_accel = total_steps / 2;
-        motion.n_decel = motion.n_accel;
-        motion.n_cruise = total_steps % 2;
-
-        float f_peak2 = (float)(start_freq_hz * start_freq_hz) + (2.0f * accel_steps_per_sec2 * motion.n_accel);
-        motion.cruise_freq = (uint32_t)std::sqrt(f_peak2);
-    } else {
-        motion.n_accel = n_accel_allowed;
-        motion.n_decel = n_accel_allowed;
-        motion.n_cruise = total_steps - (motion.n_accel + motion.n_decel);
-        motion.cruise_freq = f_max;
-    }
-
-    motion.start_freq = start_freq_hz;
-    motion.end_freq = start_freq_hz;
-
-    return motion;
-}
+#include "smooth_encoder.hpp"
+#include "stepper_profiles.h"
+#include "Q3hb220m.hpp"
 
 static const char* TAG = "Q3HB220M";
 Q3hb220m* Q3hb220m::instance_ = nullptr;
@@ -81,6 +37,19 @@ static float get_shortest_delta_degrees(float current_angle, float target_angle)
     return delta;
 }
 
+bool IRAM_ATTR Q3hb220m::david_austin_adapter_cb(void* ctx, uint32_t* pulse)
+{
+    auto* p = static_cast<trapezoidal_david_austin_profile_t*>(ctx);
+
+    bool has_step = trapezoidal_david_austin_profile_next_step(p);
+
+    if (has_step) {
+        *pulse = p->c;
+    }
+
+    return has_step;
+}
+
 Q3hb220m::Q3hb220m() {
     instance_ = this;
 }
@@ -96,12 +65,6 @@ void Q3hb220m::emergency_shutdown_callback() {
     if (instance_ && instance_->config_.pin_mf != GPIO_NUM_NC) {
         gpio_set_level(instance_->config_.pin_mf, 1);
     }
-}
-
-uint32_t Q3hb220m::ticks_to_target_rpm(uint32_t ticks, uint32_t steps_per_rev) const {
-    if (ticks == 0 || steps_per_rev == 0) return 1;
-    uint64_t rpm = 30'000'000ULL / (static_cast<uint64_t>(ticks) * steps_per_rev);
-    return std::max<uint32_t>(1, static_cast<uint32_t>(rpm));
 }
 
 bool Q3hb220m::init(const Config& config) {
@@ -161,11 +124,11 @@ bool Q3hb220m::init(const Config& config) {
         is_valid_subdivision(saved_settings_.sk1_steps_per_rev) &&
         is_valid_subdivision(saved_settings_.sk2_steps_per_rev)) {
         
-        accumulated_angle_degrees_ = saved_settings_.position_degrees;
+        accumulated_milidegrees_ = saved_settings_.position_milidegrees;
     } else {
         ESP_LOGW(TAG, "Loaded invalid or missing NVS settings. Falling back to defaults.");
         saved_settings_ = config_.default_settings;
-        accumulated_angle_degrees_ = saved_settings_.position_degrees;
+        accumulated_milidegrees_ = saved_settings_.position_milidegrees;
         save_settings_to_nvs();
     }
 
@@ -207,10 +170,6 @@ void Q3hb220m::apply_gpio_signals_with_timing() {
     esp_rom_delay_us(3);
 }
 
-uint32_t Q3hb220m::get_speed_ticks() const {
-    return saved_settings_.speed_ticks;
-}
-
 uint32_t Q3hb220m::get_active_subdivision_value() const {
     return (saved_settings_.active_subdivision == SubdivisionGroup::SK1) 
            ? saved_settings_.sk1_steps_per_rev 
@@ -225,7 +184,7 @@ bool Q3hb220m::set_subdivision_group(SubdivisionGroup group) {
         return false;
     }
 
-    accumulated_angle_degrees_ = get_raw_accumulated_degrees();
+    accumulated_milidegrees_ = get_accumulated_milidegrees();
 
     pcnt_tracker_.reset();
 
@@ -244,25 +203,32 @@ bool Q3hb220m::set_sk1_steps_per_rev(uint32_t steps_per_rev) {
     return true;
 }
 
+bool Q3hb220m::set_sk1_index(uint8_t index) {
+    if (index >= VALID_SUBDIVISIONS.size()) {
+        ESP_LOGE(TAG, "Rejected SK1 index: %X. Must be in range [0, F].", index);
+        return false;
+    }
+    saved_settings_.sk1_steps_per_rev = VALID_SUBDIVISIONS[index];
+    ESP_LOGI(TAG, "SK1 subdivision set to %u s/r (index %X)", VALID_SUBDIVISIONS[index], index);
+    return true;
+}
+
+bool Q3hb220m::set_sk2_index(uint8_t index) {
+    if (index >= VALID_SUBDIVISIONS.size()) {
+        ESP_LOGE(TAG, "Rejected SK2 index: %X. Must be in range [0, F].", index);
+        return false;
+    }
+    saved_settings_.sk2_steps_per_rev = VALID_SUBDIVISIONS[index];
+    ESP_LOGI(TAG, "SK2 subdivision set to %u s/r (index %X)", VALID_SUBDIVISIONS[index], index);
+    return true;
+}
+
 bool Q3hb220m::set_sk2_steps_per_rev(uint32_t steps_per_rev) {
     if (!is_valid_subdivision(steps_per_rev)) {
         ESP_LOGE(TAG, "Rejected SK2 setting: %lu s/r. Value not supported by hardware table.", steps_per_rev);
         return false;
     }
     saved_settings_.sk2_steps_per_rev = steps_per_rev;
-    return true;
-}
-
-bool Q3hb220m::set_speed_ticks(uint32_t ticks) {
-    uint32_t min_ticks = rmt_tx_.us_to_ticks(config_.min_pulse_width_us);
-    if (min_ticks == 0) min_ticks = 1;
-
-    uint32_t max_ticks = RmtTx::MAX_SYMBOL_TICKS; // 32767
-
-    if (ticks < min_ticks) ticks = min_ticks;
-    if (ticks > max_ticks) ticks = max_ticks;
-
-    saved_settings_.speed_ticks = ticks;
     return true;
 }
 
@@ -276,6 +242,36 @@ void Q3hb220m::set_direction(Direction dir) {
     current_dir_ = dir;
     gpio_set_level(config_.pin_dr, static_cast<uint32_t>(dir));
     esp_rom_delay_us(10); // Datasheet signal setup time requirement
+}
+
+bool Q3hb220m::set_start_speed_rev_s(float start_speed_rev_s) {
+    if (start_speed_rev_s < 0.0f || start_speed_rev_s > saved_settings_.speed_rev_s) {
+        ESP_LOGE(TAG, "Rejected start speed setting: %.2f rev/s.", 
+                 start_speed_rev_s);
+        return false;
+    }
+    saved_settings_.start_speed_rev_s = start_speed_rev_s;
+    return true;
+}
+
+bool Q3hb220m::set_speed_rev_s(float speed_rev_s) {
+    if (speed_rev_s < 0.0f || speed_rev_s < saved_settings_.start_speed_rev_s) {
+        ESP_LOGE(TAG, "Rejected speed setting: %.2f rev/s.", 
+                 speed_rev_s);
+        return false;
+    }
+    saved_settings_.speed_rev_s = speed_rev_s;
+    return true;
+}
+
+bool Q3hb220m::set_acceleration_rev_s2(float acceleration_rev_s2) {
+    if (acceleration_rev_s2 < 0.0f) {
+        ESP_LOGE(TAG, "Rejected acceleration setting: %.2f rev/s².", 
+                 acceleration_rev_s2);
+        return false;
+    }
+    saved_settings_.acceleration_rev_s2 = acceleration_rev_s2;
+    return true;
 }
 
 void Q3hb220m::set_motor_free(bool enable_free) {
@@ -305,21 +301,21 @@ bool Q3hb220m::move_delta_angle(float delta_degrees) {
     Direction dir = (delta_degrees >= 0.0f) ? Direction::CCW : Direction::CW;
     set_direction(dir);
 
-    uint32_t s_per_rev = get_active_subdivision_value();
-    uint32_t total_steps = static_cast<uint32_t>(std::round((std::abs(delta_degrees) / 360.0f) * s_per_rev));
+    uint32_t steps_per_rev = get_active_subdivision_value();
+    uint32_t total_steps = static_cast<uint32_t>(std::round((std::abs(delta_degrees) / 360.0f) * steps_per_rev));
 
     if (total_steps == 0) return true;
 
-    smooth_motion_config_t motion = plan_motion(total_steps, 
-                70, 
-                s_per_rev, 
-                1500, 
-                1.0f);
+    trapezoidal_profile_ = plan_trapezoidal_david_austin_motion(total_steps, 
+        saved_settings_.start_speed_rev_s, 
+        saved_settings_.speed_rev_s, 
+        saved_settings_.acceleration_rev_s2, 
+        steps_per_rev, 
+        rmt_tx_.get_resolution_hz());
 
     apply_gpio_signals_with_timing();
 
-    return rmt_tx_.start_smooth_curve(motion.n_accel, motion.n_cruise, motion.n_decel,
-                                      motion.start_freq, motion.cruise_freq, motion.end_freq);
+    return rmt_tx_.transmit_encoded_curve(david_austin_adapter_cb, (void*)&trapezoidal_profile_, 1, 3);
 }
 
 bool Q3hb220m::move_absolute_angle(float abs_degrees) {
@@ -330,34 +326,11 @@ bool Q3hb220m::move_absolute_angle(float abs_degrees) {
 }
 
 void Q3hb220m::tare() {
-    accumulated_angle_degrees_ = 0.0;
+    accumulated_milidegrees_ = 0;
     pcnt_tracker_.reset();
 }
 
-bool Q3hb220m::start_continuous(Direction dir) {
-    if (!is_driver_ready()) {
-        ESP_LOGE(TAG, "Action blocked: Driver RDY is LOW (Fault or Unpowered)");
-        stop();
-        return false;
-    }
-
-    if (!is_initialized_ || motor_free_ || rmt_tx_.is_busy()) {
-        return false;
-    }
-
-    set_direction(dir);
-    apply_gpio_signals_with_timing();
-
-    uint32_t s_per_rev = get_active_subdivision_value();
-    uint32_t ticks = get_speed_ticks();
-    uint32_t target_rpm = ticks_to_target_rpm(ticks, s_per_rev);
-
-    is_continuous_ = true;
-    return true;
-}
-
 bool Q3hb220m::stop() {
-    is_continuous_ = false;
     return rmt_tx_.stop();
 }
 
@@ -369,19 +342,19 @@ int64_t Q3hb220m::get_current_steps() const {
     return pcnt_tracker_.get_total_steps();
 }
 
-double Q3hb220m::get_raw_accumulated_degrees() const {
-    uint32_t s_per_rev = get_active_subdivision_value();
-    if (s_per_rev == 0) return accumulated_angle_degrees_;
+int32_t Q3hb220m::get_accumulated_milidegrees() const {
+    uint32_t steps_per_rev = get_active_subdivision_value();
+    if (steps_per_rev == 0) return accumulated_milidegrees_;
 
     int64_t current_pcnt_steps = pcnt_tracker_.get_total_steps();
     
-    double session_degrees = (static_cast<double>(current_pcnt_steps) / static_cast<double>(s_per_rev)) * 360.0;
+    int32_t session_milidegrees = static_cast<int32_t>(current_pcnt_steps * (360 * 1000 / steps_per_rev));
 
-    return accumulated_angle_degrees_ + session_degrees;
+    return accumulated_milidegrees_ + session_milidegrees;
 }
 
 float Q3hb220m::get_current_angle_degrees() const {
-    return normalize_angle_360(static_cast<float>(get_raw_accumulated_degrees()));
+    return normalize_angle_360(static_cast<float>(get_accumulated_milidegrees()/1000.0f));
 }
 
 Q3hb220m::SubdivisionGroup Q3hb220m::get_subdivision_group() const { 
@@ -396,24 +369,20 @@ uint32_t Q3hb220m::get_sk2_steps() const {
     return saved_settings_.sk2_steps_per_rev; 
 }
 
-bool Q3hb220m::is_continuous() const { 
-    return is_continuous_; 
-}
-
 Q3hb220m::Direction Q3hb220m::get_current_direction() const { 
     return current_dir_; 
 }
 
-float Q3hb220m::get_speed_deg_per_sec() const {
-    uint32_t ticks = saved_settings_.speed_ticks;
-    if (ticks == 0) return 0.0f;
+float Q3hb220m::get_start_speed_rev_s() const {
+    return saved_settings_.start_speed_rev_s;
+}
 
-    uint32_t res_hz = rmt_tx_.get_resolution_hz();
-    
-    float pulse_freq_hz = static_cast<float>(res_hz) / (2.0f * static_cast<float>(ticks));
-    uint32_t s_per_rev = get_active_subdivision_value();
+float Q3hb220m::get_speed_rev_s() const {
+    return saved_settings_.speed_rev_s;
+}
 
-    return (pulse_freq_hz / static_cast<float>(s_per_rev)) * 360.0f;
+float Q3hb220m::get_acceleration_rev_s2() const {
+    return saved_settings_.acceleration_rev_s2;
 }
 
 uint32_t Q3hb220m::get_rmt_resolution_hz() const {
@@ -434,7 +403,7 @@ void IRAM_ATTR Q3hb220m::gpio_rdy_isr_handler(void* arg) {
 }
 
 bool Q3hb220m::save_settings_to_nvs() {
-    saved_settings_.position_degrees = get_raw_accumulated_degrees();
+    saved_settings_.position_milidegrees = get_accumulated_milidegrees();
     return nvs_storage_.write_blob("settings", &saved_settings_, sizeof(SavedSettings));
 }
 

@@ -7,6 +7,7 @@ list(APPEND EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_LIST_DIR}/source/driver"
     "${CMAKE_CURRENT_LIST_DIR}/source/control"
     "${CMAKE_CURRENT_LIST_DIR}/source/app"
+    "${CMAKE_CURRENT_LIST_DIR}/source/bsp"
 )
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS 1)

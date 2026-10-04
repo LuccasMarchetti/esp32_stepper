@@ -1,14 +1,17 @@
+#include "esp_attr.h"
+#include "esp_log.h"
+
 #include "RmtTx.hpp"
 #include "smooth_encoder.hpp"
-#include "esp_log.h"
+#include "rmt_stepper_encoder.hpp"
 
 static const char *TAG = "RmtTx";
 
 RmtTx::RmtTx() = default;
 
 RmtTx::~RmtTx() {
-    if (smooth_encoder_) {
-        rmt_del_encoder(smooth_encoder_);
+    if (step_encoder_) {
+        rmt_del_encoder(step_encoder_);
     }
     if (tx_chan_) {
         rmt_disable(tx_chan_);
@@ -39,23 +42,15 @@ bool RmtTx::init(const Config& config) {
         return false;
     }
 
-    rmt_tx_event_callbacks_t cbs = {
-        .on_trans_done = RmtTx::on_trans_done,
-    };
-    rmt_tx_register_event_callbacks(tx_chan_, &cbs, this);
-
-    smooth_encoder_config_t enc_cfg = {
-            .resolution_hz = resolution_hz_, // 1 MHz
-            .pulse_width_us = 3      // Pulso ativo de 2us
-        };
-
-    ESP_ERROR_CHECK(rmt_new_smooth_stepper_encoder(&enc_cfg, &smooth_encoder_));
-
     if (rmt_enable(tx_chan_) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enable RMT channel");
         return false;
     }
-    is_enabled_ = true;
+
+    rmt_tx_event_callbacks_t cbs = {
+        .on_trans_done = RmtTx::on_trans_done,
+    };
+    rmt_tx_register_event_callbacks(tx_chan_, &cbs, this);
 
     return true;
 }
@@ -69,154 +64,31 @@ bool RmtTx::is_busy() const {
     return is_busy_.load(std::memory_order_relaxed);
 }
 
-bool RmtTx::transmit_pulse_pattern(uint16_t high_ticks, uint16_t low_ticks, uint32_t count) {
-    if (is_busy_.load(std::memory_order_acquire) || count == 0) {
-        return false;
-    }
-
-    // Build uniform pattern buffer
-    rmt_symbol_word_t symbol = {
-        .duration0 = high_ticks,
-        .level0 = 1,
-        .duration1 = low_ticks,
-        .level1 = 0
-    };
-
-    symbol_buffer_.assign(count, symbol);
-
-    rmt_transmit_config_t tx_config = {
-        .loop_count = 0,
-        .flags = {
-            .eot_level = 0,
-            .queue_nonblocking = 0,
-        },
-    };
-
-    return send_buffer(&tx_config);
-}
-
-bool RmtTx::transmit_symbols(const rmt_symbol_word_t* symbols, size_t count) {
-    if (is_busy_.load(std::memory_order_acquire) || symbols == nullptr || count == 0) {
-        return false;
-    }
-
-    // If external symbols were passed, copy them to maintain buffer lifetime during transmission
-    if (symbols != symbol_buffer_.data()) {
-        symbol_buffer_.assign(symbols, symbols + count);
-    }
-
-    rmt_transmit_config_t tx_config = {
-        .loop_count = 0,
-        .flags = {
-            .eot_level = 0,
-            .queue_nonblocking = 0,
-        },
-    };
-
-    return send_buffer(&tx_config);
-}
-
-bool RmtTx::start_continuous_pulses(uint16_t high_ticks, uint16_t low_ticks) {
+bool RmtTx::transmit_encoded_curve(bool (*cb)(void*, uint32_t*), void* profile, uint32_t min_high_pulse_us, uint32_t min_low_pulse_us) {
     if (is_busy_.load(std::memory_order_acquire)) {
         return false;
     }
 
-    symbol_ = {
-        .duration0 = high_ticks,
-        .level0 = 1,
-        .duration1 = low_ticks,
-        .level1 = 0
-    };
+    step_encoder_config_.min_pulse_high_us = min_high_pulse_us;
+    step_encoder_config_.min_pulse_low_us = min_low_pulse_us;
+    step_encoder_config_.resolution_hz = resolution_hz_;
 
-    rmt_transmit_config_t tx_config = {
-        .loop_count = -1,
-        .flags = {
-            .eot_level = 0,
-            .queue_nonblocking = 0,
-        },
-    };
-
-    return send_buffer(&tx_config);
-}
-
-bool RmtTx::send_buffer(const rmt_transmit_config_t* tx_config) {
-    if (!smooth_encoder_ || !tx_chan_) {
-        return false;
+    if (!step_encoder_) {
+        ESP_ERROR_CHECK(rmt_new_step_encoder(&step_encoder_config_, &step_encoder_));
     }
+    
+    is_enabled_ = true;
 
-    if (smooth_encoder_) {
-        rmt_encoder_reset(smooth_encoder_);
-    }
-
-    if (!is_enabled_) {
-        esp_err_t err = rmt_enable(tx_chan_);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to enable RMT channel: %s", esp_err_to_name(err));
-            return false;
-        }
-        is_enabled_ = true;
-    }
-
-    is_busy_.store(true, std::memory_order_release);
-
-    esp_err_t err = rmt_transmit(
-        tx_chan_,
-        smooth_encoder_,
-        (tx_config->loop_count == -1) ? &symbol_ : symbol_buffer_.data(),
-        (tx_config->loop_count == -1) ? sizeof(rmt_symbol_word_t) : symbol_buffer_.size() * sizeof(rmt_symbol_word_t),
-        tx_config
-    );
-
-    if (err != ESP_OK) {
-        is_busy_.store(false, std::memory_order_release);
-        ESP_LOGE(TAG, "Transmission failed: %s", esp_err_to_name(err));
-        return false;
-    }
-
-    return true;
-}
-
-bool RmtTx::start_smooth_curve(uint32_t n_accel, uint32_t n_cruise, uint32_t n_decel,
-                               uint32_t start_freq, uint32_t cruise_freq, uint32_t end_freq) {
-
-    // 1. Validação de Handles do RMT
-    if (!tx_chan_ || !smooth_encoder_) {
-        ESP_LOGE("RmtTx", "Erro: Canal RMT ou Encoder nao inicializado!");
-        return false;
-    }
-
-    // 2. Trava de Ocupado (Busy)
-    if (is_busy_.load(std::memory_order_acquire)) {
-        return false;
-    }
-
-    smooth_motion_config_t motion = {
-        .n_accel = n_accel,
-        .n_cruise = n_cruise,
-        .n_decel = n_decel,
-        .start_freq = start_freq,
-        .cruise_freq = cruise_freq,
-        .end_freq = end_freq
-    };
-
-    // 3. Prepara as rampas na RAM
-    if (rmt_smooth_stepper_prepare(smooth_encoder_, &motion) != ESP_OK) {
-        return false; // is_busy_ ainda eh false aqui
-    }
-
-    // Seta busy apenas quando for realmente transmitir
-    is_busy_.store(true, std::memory_order_release);
+    source_.cb = static_cast<step_interval_cb_t>(cb);
+    source_.ctx = profile;
 
     rmt_transmit_config_t tx_config = {
         .loop_count = 0,
         .flags = { .eot_level = 0, .queue_nonblocking = 0 }
     };
 
-    // 4. Transmissão: Passa &motion e sizeof(motion) em vez de NULL e 0
-    esp_err_t err = rmt_transmit(tx_chan_, smooth_encoder_, &motion, sizeof(motion), &tx_config);
-    if (err != ESP_OK) {
-        ESP_LOGE("RmtTx", "Erro ao transmitir RMT: %s", esp_err_to_name(err));
-        is_busy_.store(false, std::memory_order_release); // Destrava em caso de falha
+    if (rmt_transmit(tx_chan_, step_encoder_, &source_, sizeof(source_), &tx_config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start RMT transmission");
         return false;
     }
 
