@@ -7,13 +7,12 @@
 #include "driver/rmt_tx.h"
 #include "driver/gpio.h"
 
-#include "smooth_encoder.hpp"
 #include "rmt_stepper_encoder.hpp"
 
 /**
  * @brief C++ Wrapper for ESP-IDF v6.x RMT (Remote Control Transmitter) TX Driver.
  */
-class RmtTx {
+class RmtTxDriver {
 public:
     using CallbackFn = void (*)(void* user_arg);
 
@@ -26,12 +25,12 @@ public:
         uint32_t trans_queue_depth = 4;      // Max transactions queued
     };
 
-    RmtTx();
-    ~RmtTx();
+    RmtTxDriver();
+    ~RmtTxDriver();
 
     // Prevent copying to avoid resource duplication
-    RmtTx(const RmtTx&) = delete;
-    RmtTx& operator=(const RmtTx&) = delete;
+    RmtTxDriver(const RmtTxDriver&) = delete;
+    RmtTxDriver& operator=(const RmtTxDriver&) = delete;
 
     /**
      * @brief Initializes the RMT TX channel and copy encoder.

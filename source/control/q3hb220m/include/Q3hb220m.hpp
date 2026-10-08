@@ -7,7 +7,7 @@
 #include <atomic>
 
 #include "stepper_profiles.h"
-#include "RmtTx.hpp"
+#include "RmtTxDriver.hpp"
 #include "PcntTracker.hpp"
 #include "NvsStorage.hpp"
 
@@ -149,7 +149,7 @@ private:
 
     trapezoidal_david_austin_profile_t trapezoidal_profile_;
 
-    RmtTx rmt_tx_;
+    RmtTxDriver rmt_tx_;
     PcntTracker pcnt_tracker_;
     NvsStorage nvs_storage_{"q3hb_cfg"};
     

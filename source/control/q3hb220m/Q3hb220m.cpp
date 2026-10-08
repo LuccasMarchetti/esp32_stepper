@@ -7,7 +7,6 @@
 #include "esp_rom_sys.h"
 #include "esp_attr.h"
 
-#include "smooth_encoder.hpp"
 #include "stepper_profiles.h"
 #include "Q3hb220m.hpp"
 
@@ -133,7 +132,7 @@ bool Q3hb220m::init(const Config& config) {
     }
 
     // Initialize RMT driver for PU (Pulse) pin
-    RmtTx::Config rmt_config = {
+    RmtTxDriver::Config rmt_config = {
         .gpio_num = config_.pin_pu,
         .resolution_hz = 1'000'000, // 1 MHz resolution (1 tick = 1 µs)
     };
